@@ -418,45 +418,47 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
     return;
   }
 
-  bool is_new_placement_group_scheduled = false;
-  while (!pending_placement_groups_.empty() && !is_new_placement_group_scheduled) {
-    auto iter = pending_placement_groups_.begin();
-    if (iter->first > absl::GetCurrentTimeNanos()) {
-      // Here the rank equals the time to schedule, and it's an ordered tree,
-      // it means all the other tasks should be scheduled after this one.
-      // If the first one won't be scheduled, we just skip.
-      // Tick will cover the next time retry.
-      break;
-    }
-    auto backoff = iter->second.first;
-    auto placement_group = std::move(iter->second.second);
-    pending_placement_groups_.erase(iter);
+  // === 严格 FIFO：只尝试队首一个 PG，不能放就直接返回，不扫描后续 ===
+  auto iter = pending_placement_groups_.begin();
 
-    const auto &placement_group_id = placement_group->GetPlacementGroupID();
-    // Do not reschedule if the placement group has removed already.
-    if (registered_placement_groups_.contains(placement_group_id)) {
-      auto stats = placement_group->GetMutableStats();
-      stats->set_scheduling_attempt(stats->scheduling_attempt() + 1);
-      stats->set_scheduling_started_time_ns(absl::GetCurrentTimeNanos());
-      MarkSchedulingStarted(placement_group_id);
-      // We can't use designated initializers thanks to MSVC (error C7555).
-      gcs_placement_group_scheduler_->ScheduleUnplacedBundles(SchedulePgRequest{
-          /*placement_group=*/placement_group,
-          /*failure_callback=*/
-          [this, backoff](std::shared_ptr<GcsPlacementGroup> failure_placement_group,
-                          bool is_feasible) {
-            OnPlacementGroupCreationFailed(
-                std::move(failure_placement_group), backoff, is_feasible);
-          },
-          /*success_callback=*/
-          [this](std::shared_ptr<GcsPlacementGroup> success_placement_group) {
-            OnPlacementGroupCreationSuccess(success_placement_group);
-          }});
-      is_new_placement_group_scheduled = true;
-    }
-    // If the placement group is not registered == removed.
+  // 还没到调度时间：直接返回，等待下一次 Tick / 资源变化
+  if (iter->first > absl::GetCurrentTimeNanos()) {
+    return;
   }
-  ++counts_[CountType::SCHEDULING_PENDING_PLACEMENT_GROUP];
+
+  // 注意：这里不要把队首元素从 pending_placement_groups_ 里移除。
+  // 只有在“成功放置”时，才从 pending 队列删除（见 success 回调）。
+  auto backoff = iter->second.first;
+  auto placement_group = iter->second.second;
+  const auto &placement_group_id = placement_group->GetPlacementGroupID();
+
+  // 如果此 PG 仍然注册着，尝试调度
+  if (registered_placement_groups_.contains(placement_group_id)) {
+    auto stats = placement_group->GetMutableStats();
+    stats->set_scheduling_attempt(stats->scheduling_attempt() + 1);
+    stats->set_scheduling_started_time_ns(absl::GetCurrentTimeNanos());
+    MarkSchedulingStarted(placement_group_id);
+
+    // 仅尝试队首一个 PG：失败不动队列，成功才出队
+    gcs_placement_group_scheduler_->ScheduleUnplacedBundles(SchedulePgRequest{
+        /*placement_group=*/placement_group,
+        /*failure_callback=*/
+        [this, backoff](std::shared_ptr<GcsPlacementGroup> pg, bool is_feasible) {
+          // 失败：回退/重试策略与原逻辑一致，但不从 pending 队列删除；
+          // 让它继续停在队首，等待下一次资源变化再试。
+          OnPlacementGroupCreationFailed(std::move(pg), backoff, is_feasible);
+        },
+        /*success_callback=*/
+        [this](std::shared_ptr<GcsPlacementGroup> pg) {
+          // 成功：先执行业务上的成功处理
+          OnPlacementGroupCreationSuccess(pg);
+          // 再把该 PG 从 pending 队列删除（严格 FIFO：只在成功时出队）
+          RemoveFromPendingQueue(pg->GetPlacementGroupID());
+        }});
+
+    // 本轮只尝试队首一个 PG；计数保持与原实现一致
+    ++counts_[CountType::SCHEDULING_PENDING_PLACEMENT_GROUP];
+  }
 }
 
 void GcsPlacementGroupManager::HandleCreatePlacementGroup(
