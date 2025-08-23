@@ -330,18 +330,27 @@ void GcsPlacementGroupManager::OnPlacementGroupCreationFailed(
               state == rpc::PlacementGroupTableData::REMOVED)
         << "State: " << state;
 
+    const auto pg_id = placement_group->GetPlacementGroupID();
+
     if (state == rpc::PlacementGroupTableData::RESCHEDULING) {
       // NOTE: If a node is dead, the placement group scheduler should try to recover the
       // group by rescheduling the bundles of the dead node. This should have higher
       // priority than trying to place other placement groups.
       stats->set_scheduling_state(rpc::PlacementGroupStats::FAILED_TO_COMMIT_RESOURCES);
-      AddToPendingQueue(std::move(placement_group), /*rank=*/0);
+      // 只有当它不在 pending 队列里时才重新入队
+      if (!IsInPendingQueue(pg_id)) {
+        AddToPendingQueue(std::move(placement_group), /*rank=*/0);
+      }
     } else if (state == rpc::PlacementGroupTableData::PENDING) {
       stats->set_scheduling_state(rpc::PlacementGroupStats::NO_RESOURCES);
-      AddToPendingQueue(std::move(placement_group), std::nullopt, backoff);
-    } else {
+      if (!IsInPendingQueue(pg_id)) {
+        AddToPendingQueue(std::move(placement_group), std::nullopt, backoff);
+      }
+    } else {  // REMOVED（注意：这分支通常是删除后重试用例，保持原语义的同时防重复）
       stats->set_scheduling_state(rpc::PlacementGroupStats::REMOVED);
-      AddToPendingQueue(std::move(placement_group), std::nullopt, backoff);
+      if (!IsInPendingQueue(pg_id)) {
+        AddToPendingQueue(std::move(placement_group), std::nullopt, backoff);
+      }
     }
   }
 
@@ -450,10 +459,10 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
         },
         /*success_callback=*/
         [this](std::shared_ptr<GcsPlacementGroup> pg) {
-          // 成功：先执行业务上的成功处理
-          OnPlacementGroupCreationSuccess(pg);
-          // 再把该 PG 从 pending 队列删除（严格 FIFO：只在成功时出队）
+          // 先删掉旧的 pending 条目
           RemoveFromPendingQueue(pg->GetPlacementGroupID());
+          // 再让它在需要时自己重新入队
+          OnPlacementGroupCreationSuccess(pg);
         }});
 
     // 本轮只尝试队首一个 PG；计数保持与原实现一致
