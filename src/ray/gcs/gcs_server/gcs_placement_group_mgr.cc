@@ -26,6 +26,9 @@
 #include "ray/stats/metric_defs.h"
 #include "src/ray/protobuf/gcs.pb.h"
 
+#include "ray/common/scheduling/resource_set.h"
+#include "ray/common/scheduling/scheduling_ids.h"
+
 namespace ray {
 namespace gcs {
 
@@ -52,6 +55,122 @@ ExponentialBackoff CreateDefaultBackoff() {
       RayConfig::instance().gcs_create_placement_group_retry_multiplier(),
       max_delay_ns);
 }
+
+// ==================== 新增：按 Job 统计 GPU×时间 ====================
+
+// 「累计 GPU×时间」：单位可以理解为 GPU·秒（只是一个相对值，用来排序）
+using JobGpuUsageMap = absl::flat_hash_map<JobID, double>;
+// 「当前时刻占用的 GPU 数」：每次按 registered_placement_groups_ 重算
+using JobCurrentGpuMap = absl::flat_hash_map<JobID, double>;
+
+// 这几个用静态单例，避免改 .h
+JobGpuUsageMap &GetJobGpuUsageMap() {
+  static auto *m = new JobGpuUsageMap();
+  return *m;
+}
+
+JobCurrentGpuMap &GetJobCurrentGpuMap() {
+  static auto *m = new JobCurrentGpuMap();
+  return *m;
+}
+
+// 上一次做 GPU×时间 积分的时间戳（ns）
+int64_t &GetLastGpuUsageUpdateTimeNs() {
+  static int64_t t = 0;
+  return t;
+}
+
+// 计算单个 bundle 需要多少 GPU
+double GetBundleGpuCount(const BundleSpecification &bundle_spec) {
+  const auto &req = bundle_spec.GetRequiredResources();
+  const auto &resource_set = req.GetResourceSet();
+
+  // 从资源集合里取出 GPU 数量
+  const auto &gpu_quantity =
+      resource_set.Get(::ray::scheduling::ResourceID(kGPU_ResourceLabel));
+  return gpu_quantity.Double();
+}
+
+// 根据当前所有已注册 PG（只看已经放到某个 node 上的 bundle）
+// 重新统计「当前每个 Job 正在占用的 GPU 数」
+void RecomputeJobCurrentGpu(
+    const absl::flat_hash_map<PlacementGroupID, std::shared_ptr<GcsPlacementGroup>>
+        &registered_placement_groups) {
+  auto &current = GetJobCurrentGpuMap();
+  current.clear();
+
+  for (const auto &entry : registered_placement_groups) {
+    const auto &pg = entry.second;
+    const JobID &job_id = pg->GetCreatorJobId();
+    if (job_id.IsNil()) {
+      continue;
+    }
+
+    double job_gpu = 0.0;
+    for (const auto &bundle_ptr : pg->GetBundles()) {
+      const auto &bundle = *bundle_ptr;
+
+      // 还没分配到具体 node 的 bundle 不算资源占用
+      if (bundle.NodeId().IsNil()) {
+        continue;
+      }
+
+      job_gpu += GetBundleGpuCount(bundle);
+    }
+
+    if (job_gpu > 0) {
+      current[job_id] += job_gpu;
+    }
+  }
+}
+
+// 基于「当前占用 GPU 数」做一次积分，更新到累计 GPU×时间
+void UpdateJobGpuUsage(
+    const absl::flat_hash_map<PlacementGroupID, std::shared_ptr<GcsPlacementGroup>>
+        &registered_placement_groups) {
+  const int64_t now = absl::GetCurrentTimeNanos();
+  auto &last = GetLastGpuUsageUpdateTimeNs();
+
+  // 第一次调用：只初始化当前占用，不积分
+  if (last == 0) {
+    last = now;
+    RecomputeJobCurrentGpu(registered_placement_groups);
+    return;
+  }
+
+  double delta_sec = static_cast<double>(now - last) / 1e9;
+  if (delta_sec < 0) {
+    // 理论上不会出现，防御性写法
+    delta_sec = 0;
+  }
+
+  // 先用旧的 last 时间点到现在的时间差，按“上一段时间的 GPU 占用”做积分
+  RecomputeJobCurrentGpu(registered_placement_groups);
+  auto &current = GetJobCurrentGpuMap();
+  auto &usage = GetJobGpuUsageMap();
+
+  for (const auto &kv : current) {
+    const JobID &job_id = kv.first;
+    const double cur_gpu = kv.second;  // 当前占用的 GPU 数
+    usage[job_id] += cur_gpu * delta_sec;
+  }
+
+  last = now;
+}
+
+// 获取某个 Job 的「累计 GPU×时间」score，找不到就视为 0
+double GetJobGpuTimeUsageScore(const JobID &job_id) {
+  if (job_id.IsNil()) {
+    return 0.0;
+  }
+  auto &usage = GetJobGpuUsageMap();
+  auto it = usage.find(job_id);
+  if (it == usage.end()) {
+    return 0.0;
+  }
+  return it->second;
+}
+
 }  // namespace
 
 void GcsPlacementGroup::UpdateState(
@@ -427,70 +546,48 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
     return;
   }
 
+  // 更新基于 Job 的「GPU×时间」积分
+  UpdateJobGpuUsage(registered_placement_groups_);
+
   const int64_t now = absl::GetCurrentTimeNanos();
 
-  // === 1) 统计每个 Job 当前已经“占用”的 PG 数量（作为 usage） ===
-  //
-  // 我们把状态为 CREATED / RESCHEDULING 的 PG 都算作“已经占用资源”的 PG。
-  // （PREPARED 可以视情况加进去；当前先不算，保持语义简单。）
-  absl::flat_hash_map<JobID, int64_t> running_pg_per_job;
-
-  for (const auto &entry : registered_placement_groups_) {
-    const auto &pg = entry.second;
-    const auto state = pg->GetState();
-
-    if (state == rpc::PlacementGroupTableData::CREATED ||
-        state == rpc::PlacementGroupTableData::RESCHEDULING) {
-      const JobID job_id = pg->GetCreatorJobId();
-      // JobID::Nil() 也会被统计进去，相当于“系统/匿名 Job”占用量。
-      running_pg_per_job[job_id] += 1;
-    }
-  }
-
-  // === 2) 在所有“已经到期”（rank <= now）的 pending PG 中，
-  //         选择 usage 最小的 Job 的 PG；同一 Job 内按 rank/FIFO 选最早的一个  ===
+  // 在所有 rank <= now 的 pending PG 中：
+  //   - 先看它属于哪个 Job；
+  //   - 优先选择「累计 GPU×时间 usage 最小的 Job」；
+  //   - 同一个 Job 内仍按照 rank（时间戳）实现近似 FIFO。
   auto best_it = pending_placement_groups_.end();
-  int64_t best_usage = std::numeric_limits<int64_t>::max();
+  double best_score = 0.0;
   int64_t best_rank = 0;
+  bool found = false;
 
   for (auto it = pending_placement_groups_.begin();
        it != pending_placement_groups_.end();
        ++it) {
     const int64_t rank = it->first;
 
-    // pending_placement_groups_ 是按 rank 排序的；
-    // 一旦 rank > now，后面的都还没到调度时间，直接 break。
+    // 还没到重试时间的 PG 不参与本轮选择（之后 Tick 再调度）
     if (rank > now) {
       break;
     }
 
     const auto &pg = it->second.second;
-    const JobID job_id = pg->GetCreatorJobId();
+    const JobID &job_id = pg->GetCreatorJobId();
+    double score = GetJobGpuTimeUsageScore(job_id);
 
-    int64_t usage = 0;
-    auto u_it = running_pg_per_job.find(job_id);
-    if (u_it != running_pg_per_job.end()) {
-      usage = u_it->second;
-    }
-
-    // 先按 usage 最小；usage 相同则按 rank 更早（全局 FIFO / 每 Job 内 FIFO）
-    if (usage < best_usage || (usage == best_usage && rank < best_rank)) {
-      best_usage = usage;
-      best_rank = rank;
+    if (!found || score < best_score ||
+        (score == best_score && rank < best_rank)) {
       best_it = it;
+      best_score = score;
+      best_rank = rank;
+      found = true;
     }
   }
 
-  // 没有任何“已经到期”的 PG；要么都还在 backoff，要么队列空。
-  if (best_it == pending_placement_groups_.end()) {
-    RAY_LOG(DEBUG) << "No eligible placement groups to schedule yet (all delayed).";
+  if (!found) {
+    // 所有 pending PG 都还没到调度时间
     return;
   }
 
-  // === 3) 对选中的 PG 发起一次调度尝试 ===
-  //
-  // 注意：和原来的实现一样，这里**不**从 pending_placement_groups_ 中删除该 PG；
-  // 只有在 success_callback 里（真正放置成功）才 RemoveFromPendingQueue。
   auto backoff = best_it->second.first;
   auto placement_group = best_it->second.second;
   const auto &placement_group_id = placement_group->GetPlacementGroupID();
@@ -505,14 +602,13 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
         /*placement_group=*/placement_group,
         /*failure_callback=*/
         [this, backoff](std::shared_ptr<GcsPlacementGroup> pg, bool is_feasible) {
-          // 失败仍然复用原有逻辑：可能被标记为 infeasible，或维持在 pending 队列中，
-          // 由 backoff/资源变化触发下一次尝试。
+          // 失败：保持在 pending 队列中，只更新 backoff / 状态；
+          // 之后有资源变化或 Tick 会再尝试。
           OnPlacementGroupCreationFailed(std::move(pg), backoff, is_feasible);
         },
         /*success_callback=*/
         [this](std::shared_ptr<GcsPlacementGroup> pg) {
-          // 成功放置：从 pending 队列中删除，再交给 OnPlacementGroupCreationSuccess
-          // 做状态和持久化更新。
+          // 成功：从 pending 队列删除，再走原有的 Success 逻辑
           RemoveFromPendingQueue(pg->GetPlacementGroupID());
           OnPlacementGroupCreationSuccess(pg);
         }});
@@ -520,6 +616,7 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
     ++counts_[CountType::SCHEDULING_PENDING_PLACEMENT_GROUP];
   }
 }
+
 void GcsPlacementGroupManager::HandleCreatePlacementGroup(
     ray::rpc::CreatePlacementGroupRequest request,
     ray::rpc::CreatePlacementGroupReply *reply,
