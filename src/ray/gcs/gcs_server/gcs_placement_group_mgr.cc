@@ -427,49 +427,99 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
     return;
   }
 
-  // === 严格 FIFO：只尝试队首一个 PG，不能放就直接返回，不扫描后续 ===
-  auto iter = pending_placement_groups_.begin();
+  const int64_t now = absl::GetCurrentTimeNanos();
 
-  // 还没到调度时间：直接返回，等待下一次 Tick / 资源变化
-  if (iter->first > absl::GetCurrentTimeNanos()) {
+  // === 1) 统计每个 Job 当前已经“占用”的 PG 数量（作为 usage） ===
+  //
+  // 我们把状态为 CREATED / RESCHEDULING 的 PG 都算作“已经占用资源”的 PG。
+  // （PREPARED 可以视情况加进去；当前先不算，保持语义简单。）
+  absl::flat_hash_map<JobID, int64_t> running_pg_per_job;
+
+  for (const auto &entry : registered_placement_groups_) {
+    const auto &pg = entry.second;
+    const auto state = pg->GetState();
+
+    if (state == rpc::PlacementGroupTableData::CREATED ||
+        state == rpc::PlacementGroupTableData::RESCHEDULING) {
+      const JobID job_id = pg->GetCreatorJobId();
+      // JobID::Nil() 也会被统计进去，相当于“系统/匿名 Job”占用量。
+      running_pg_per_job[job_id] += 1;
+    }
+  }
+
+  // === 2) 在所有“已经到期”（rank <= now）的 pending PG 中，
+  //         选择 usage 最小的 Job 的 PG；同一 Job 内按 rank/FIFO 选最早的一个  ===
+  auto best_it = pending_placement_groups_.end();
+  int64_t best_usage = std::numeric_limits<int64_t>::max();
+  int64_t best_rank = 0;
+
+  for (auto it = pending_placement_groups_.begin();
+       it != pending_placement_groups_.end();
+       ++it) {
+    const int64_t rank = it->first;
+
+    // pending_placement_groups_ 是按 rank 排序的；
+    // 一旦 rank > now，后面的都还没到调度时间，直接 break。
+    if (rank > now) {
+      break;
+    }
+
+    const auto &pg = it->second.second;
+    const JobID job_id = pg->GetCreatorJobId();
+
+    int64_t usage = 0;
+    auto u_it = running_pg_per_job.find(job_id);
+    if (u_it != running_pg_per_job.end()) {
+      usage = u_it->second;
+    }
+
+    // 先按 usage 最小；usage 相同则按 rank 更早（全局 FIFO / 每 Job 内 FIFO）
+    if (usage < best_usage || (usage == best_usage && rank < best_rank)) {
+      best_usage = usage;
+      best_rank = rank;
+      best_it = it;
+    }
+  }
+
+  // 没有任何“已经到期”的 PG；要么都还在 backoff，要么队列空。
+  if (best_it == pending_placement_groups_.end()) {
+    RAY_LOG(DEBUG) << "No eligible placement groups to schedule yet (all delayed).";
     return;
   }
 
-  // 注意：这里不要把队首元素从 pending_placement_groups_ 里移除。
-  // 只有在“成功放置”时，才从 pending 队列删除（见 success 回调）。
-  auto backoff = iter->second.first;
-  auto placement_group = iter->second.second;
+  // === 3) 对选中的 PG 发起一次调度尝试 ===
+  //
+  // 注意：和原来的实现一样，这里**不**从 pending_placement_groups_ 中删除该 PG；
+  // 只有在 success_callback 里（真正放置成功）才 RemoveFromPendingQueue。
+  auto backoff = best_it->second.first;
+  auto placement_group = best_it->second.second;
   const auto &placement_group_id = placement_group->GetPlacementGroupID();
 
-  // 如果此 PG 仍然注册着，尝试调度
   if (registered_placement_groups_.contains(placement_group_id)) {
     auto stats = placement_group->GetMutableStats();
     stats->set_scheduling_attempt(stats->scheduling_attempt() + 1);
     stats->set_scheduling_started_time_ns(absl::GetCurrentTimeNanos());
     MarkSchedulingStarted(placement_group_id);
 
-    // 仅尝试队首一个 PG：失败不动队列，成功才出队
     gcs_placement_group_scheduler_->ScheduleUnplacedBundles(SchedulePgRequest{
         /*placement_group=*/placement_group,
         /*failure_callback=*/
         [this, backoff](std::shared_ptr<GcsPlacementGroup> pg, bool is_feasible) {
-          // 失败：回退/重试策略与原逻辑一致，但不从 pending 队列删除；
-          // 让它继续停在队首，等待下一次资源变化再试。
+          // 失败仍然复用原有逻辑：可能被标记为 infeasible，或维持在 pending 队列中，
+          // 由 backoff/资源变化触发下一次尝试。
           OnPlacementGroupCreationFailed(std::move(pg), backoff, is_feasible);
         },
         /*success_callback=*/
         [this](std::shared_ptr<GcsPlacementGroup> pg) {
-          // 先删掉旧的 pending 条目
+          // 成功放置：从 pending 队列中删除，再交给 OnPlacementGroupCreationSuccess
+          // 做状态和持久化更新。
           RemoveFromPendingQueue(pg->GetPlacementGroupID());
-          // 再让它在需要时自己重新入队
           OnPlacementGroupCreationSuccess(pg);
         }});
 
-    // 本轮只尝试队首一个 PG；计数保持与原实现一致
     ++counts_[CountType::SCHEDULING_PENDING_PLACEMENT_GROUP];
   }
 }
-
 void GcsPlacementGroupManager::HandleCreatePlacementGroup(
     ray::rpc::CreatePlacementGroupRequest request,
     ray::rpc::CreatePlacementGroupReply *reply,
