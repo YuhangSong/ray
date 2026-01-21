@@ -664,6 +664,11 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
   auto placement_group = best_it->second.second;
   const auto &placement_group_id = placement_group->GetPlacementGroupID();
 
+  // Remove from pending queue BEFORE scheduling starts.
+  // This ensures that on failure, the PG can be re-added with the appropriate rank
+  // (e.g., rank=0 for RESCHEDULING, or with backoff delay for PENDING).
+  pending_placement_groups_.erase(best_it);
+
   if (registered_placement_groups_.contains(placement_group_id)) {
     auto stats = placement_group->GetMutableStats();
     stats->set_scheduling_attempt(stats->scheduling_attempt() + 1);
@@ -674,14 +679,13 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
         /*placement_group=*/placement_group,
         /*failure_callback=*/
         [this, backoff](std::shared_ptr<GcsPlacementGroup> pg, bool is_feasible) {
-          // 失败：保持在 pending 队列中，只更新 backoff / 状态；
-          // 之后有资源变化或 Tick 会再尝试。
+          // 失败：PG 已从队列删除，OnPlacementGroupCreationFailed 会重新添加
+          // 并根据状态设置合适的 rank（RESCHEDULING 用 0，PENDING 用 backoff）。
           OnPlacementGroupCreationFailed(std::move(pg), backoff, is_feasible);
         },
         /*success_callback=*/
         [this](std::shared_ptr<GcsPlacementGroup> pg) {
-          // 成功：从 pending 队列删除，再走原有的 Success 逻辑
-          RemoveFromPendingQueue(pg->GetPlacementGroupID());
+          // 成功：PG 已从队列删除，直接走 Success 逻辑
           OnPlacementGroupCreationSuccess(pg);
         }});
 
