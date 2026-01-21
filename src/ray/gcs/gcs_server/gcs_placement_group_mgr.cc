@@ -14,6 +14,7 @@
 
 #include "ray/gcs/gcs_server/gcs_placement_group_mgr.h"
 
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -143,7 +144,16 @@ bool RecomputeJobCurrentGpu(
   return true;
 }
 
+// Score decay half-life in seconds. After this time, historical usage decays to half.
+// This prevents long-running jobs from being permanently penalized by old history.
+// A 1-hour half-life balances fairness between new and existing jobs.
+constexpr double kGpuUsageDecayHalfLifeSec = 3600.0;  // 1 hour
+
+// Precompute ln(2) for decay calculation
+constexpr double kLn2 = 0.693147180559945;
+
 // 基于「当前占用 GPU 数」做一次积分，更新到累计 GPU×时间
+// Also applies exponential decay to historical usage scores.
 void UpdateJobGpuUsage(
     const absl::flat_hash_map<PlacementGroupID, std::shared_ptr<GcsPlacementGroup>>
         &registered_placement_groups) {
@@ -163,12 +173,25 @@ void UpdateJobGpuUsage(
     delta_sec = 0;
   }
 
+  // Calculate decay factor: score decays exponentially over time
+  // decay_factor = exp(-ln(2) * delta_sec / half_life)
+  // After half_life seconds, old scores are worth half as much
+  double decay_factor = 1.0;
+  if (delta_sec > 0 && kGpuUsageDecayHalfLifeSec > 0) {
+    decay_factor = std::exp(-kLn2 * delta_sec / kGpuUsageDecayHalfLifeSec);
+  }
+
   // IMPORTANT: Use the OLD JobCurrentGpuMap (from time `last`) for integration
   // over the interval [last, now]. This ensures accurate accounting:
   // - If a job just acquired GPUs, it won't be overcharged
   // - If a job just released GPUs, it won't be undercharged
   auto &current = GetJobCurrentGpuMap();  // Contains values from previous update
   auto &usage = GetJobGpuUsageMap();
+
+  // Apply decay to all existing scores, then add new usage
+  for (auto &kv : usage) {
+    kv.second *= decay_factor;
+  }
 
   for (const auto &kv : current) {
     const JobID &job_id = kv.first;
