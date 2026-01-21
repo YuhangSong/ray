@@ -80,12 +80,33 @@ int64_t &GetLastGpuUsageUpdateTimeNs() {
   return t;
 }
 
+// Dirty flag for JobCurrentGpuMap - indicates GPU allocations may have changed.
+// This optimization avoids full scans of registered_placement_groups_ when
+// GPU allocations haven't changed.
+bool &GetJobCurrentGpuMapDirty() {
+  static bool dirty = true;  // Start dirty to trigger initial computation
+  return dirty;
+}
+
+// Mark the JobCurrentGpuMap as needing recomputation.
+// Call this when GPU allocations change (PG created, removed, node death, etc.)
+void MarkJobCurrentGpuMapDirty() {
+  GetJobCurrentGpuMapDirty() = true;
+}
+
 // 根据当前所有已注册 PG（只看已经放到某个 node 上的 bundle）
 // 重新统计「当前每个 Job 正在占用的 GPU 数」
 // Note: Use raw protobuf data to avoid filling the bundle cache (side effect).
-void RecomputeJobCurrentGpu(
+// Returns true if recomputation was performed, false if skipped (not dirty).
+bool RecomputeJobCurrentGpu(
     const absl::flat_hash_map<PlacementGroupID, std::shared_ptr<GcsPlacementGroup>>
         &registered_placement_groups) {
+  // Check dirty flag - skip full scan if nothing has changed
+  bool &dirty = GetJobCurrentGpuMapDirty();
+  if (!dirty) {
+    return false;  // No changes, skip recomputation
+  }
+
   auto &current = GetJobCurrentGpuMap();
   current.clear();
 
@@ -117,6 +138,9 @@ void RecomputeJobCurrentGpu(
       current[job_id] += job_gpu;
     }
   }
+
+  dirty = false;  // Clear dirty flag after recomputation
+  return true;
 }
 
 // 基于「当前占用 GPU 数」做一次积分，更新到累计 GPU×时间
@@ -505,6 +529,9 @@ void GcsPlacementGroupManager::OnPlacementGroupCreationSuccess(
   RAY_LOG(INFO) << "Successfully created placement group " << placement_group->GetName()
                 << ", id: " << placement_group->GetPlacementGroupID();
 
+  // Mark GPU map dirty since bundles are now committed to nodes
+  MarkJobCurrentGpuMapDirty();
+
   // Setup stats.
   auto stats = placement_group->GetMutableStats();
   auto now = absl::GetCurrentTimeNanos();
@@ -696,6 +723,10 @@ void GcsPlacementGroupManager::RemovePlacementGroup(
     on_placement_group_removed(Status::OK());
     return;
   }
+
+  // Mark GPU map dirty since GPU allocations may be freed
+  MarkJobCurrentGpuMapDirty();
+
   auto placement_group = std::move(placement_group_it->second);
   const JobID job_id = placement_group->GetCreatorJobId();
   registered_placement_groups_.erase(placement_group_it);
@@ -993,6 +1024,10 @@ GcsPlacementGroupManager::GetBundlesOnNode(const NodeID &node_id) const {
 void GcsPlacementGroupManager::OnNodeDead(const NodeID &node_id) {
   RAY_LOG(INFO).WithField(node_id)
       << "Node is dead, rescheduling the placement groups on the dead node.";
+
+  // Mark GPU map dirty since bundles on dead node will have their node_id cleared
+  MarkJobCurrentGpuMapDirty();
+
   auto bundles = gcs_placement_group_scheduler_->GetAndRemoveBundlesOnNode(node_id);
   for (const auto &bundle : bundles) {
     auto iter = registered_placement_groups_.find(bundle.first);
