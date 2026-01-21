@@ -170,6 +170,29 @@ double GetJobGpuTimeUsageScore(const JobID &job_id) {
   return it->second;
 }
 
+// Clean up GPU usage tracking data for a job.
+// Should be called when all placement groups for a job have been removed.
+void CleanupJobGpuUsage(const JobID &job_id) {
+  if (job_id.IsNil()) {
+    return;
+  }
+  GetJobGpuUsageMap().erase(job_id);
+  GetJobCurrentGpuMap().erase(job_id);
+}
+
+// Check if a job has any remaining placement groups.
+bool JobHasPlacementGroups(
+    const JobID &job_id,
+    const absl::flat_hash_map<PlacementGroupID, std::shared_ptr<GcsPlacementGroup>>
+        &registered_placement_groups) {
+  for (const auto &entry : registered_placement_groups) {
+    if (entry.second->GetCreatorJobId() == job_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 void GcsPlacementGroup::UpdateState(
@@ -674,7 +697,17 @@ void GcsPlacementGroupManager::RemovePlacementGroup(
     return;
   }
   auto placement_group = std::move(placement_group_it->second);
+  const JobID job_id = placement_group->GetCreatorJobId();
   registered_placement_groups_.erase(placement_group_it);
+
+  // Clean up GPU usage tracking if this was the last PG for the job.
+  // This handles user-initiated removal and is safe to call even if cleanup
+  // is also done by the caller (erasing non-existent key is a no-op).
+  if (!job_id.IsNil() && !JobHasPlacementGroups(job_id, registered_placement_groups_)) {
+    CleanupJobGpuUsage(job_id);
+    RAY_LOG(DEBUG).WithField(job_id)
+        << "Cleaned up GPU usage tracking for job (last PG removed).";
+  }
   placement_group_to_register_callbacks_.erase(placement_group_id);
 
   // Remove placement group from `named_placement_groups_` if its name is not empty.
@@ -1047,6 +1080,8 @@ void GcsPlacementGroupManager::CleanPlacementGroupIfNeededWhenJobDead(
       }
     });
   }
+  // Note: GPU usage tracking cleanup is handled by RemovePlacementGroup
+  // when the last PG for a job is removed.
 }
 
 void GcsPlacementGroupManager::CleanPlacementGroupIfNeededWhenActorDead(
@@ -1076,6 +1111,8 @@ void GcsPlacementGroupManager::CleanPlacementGroupIfNeededWhenActorDead(
       }
     });
   }
+  // Note: GPU usage tracking cleanup is handled by RemovePlacementGroup
+  // when the last PG for a job is removed.
 }
 
 void GcsPlacementGroupManager::Tick() {
