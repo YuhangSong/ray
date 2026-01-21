@@ -80,19 +80,9 @@ int64_t &GetLastGpuUsageUpdateTimeNs() {
   return t;
 }
 
-// 计算单个 bundle 需要多少 GPU
-double GetBundleGpuCount(const BundleSpecification &bundle_spec) {
-  const auto &req = bundle_spec.GetRequiredResources();
-  const auto &resource_set = req.GetResourceSet();
-
-  // 从资源集合里取出 GPU 数量
-  const auto &gpu_quantity =
-      resource_set.Get(::ray::scheduling::ResourceID(kGPU_ResourceLabel));
-  return gpu_quantity.Double();
-}
-
 // 根据当前所有已注册 PG（只看已经放到某个 node 上的 bundle）
 // 重新统计「当前每个 Job 正在占用的 GPU 数」
+// Note: Use raw protobuf data to avoid filling the bundle cache (side effect).
 void RecomputeJobCurrentGpu(
     const absl::flat_hash_map<PlacementGroupID, std::shared_ptr<GcsPlacementGroup>>
         &registered_placement_groups) {
@@ -107,15 +97,20 @@ void RecomputeJobCurrentGpu(
     }
 
     double job_gpu = 0.0;
-    for (const auto &bundle_ptr : pg->GetBundles()) {
-      const auto &bundle = *bundle_ptr;
-
+    // Use raw protobuf data to avoid filling the bundle cache
+    const auto &bundles = pg->GetPlacementGroupTableData().bundles();
+    for (const auto &bundle : bundles) {
       // 还没分配到具体 node 的 bundle 不算资源占用
-      if (bundle.NodeId().IsNil()) {
+      if (bundle.node_id().empty() ||
+          NodeID::FromBinary(bundle.node_id()).IsNil()) {
         continue;
       }
 
-      job_gpu += GetBundleGpuCount(bundle);
+      // Get GPU count directly from unit_resources map
+      auto it = bundle.unit_resources().find(kGPU_ResourceLabel);
+      if (it != bundle.unit_resources().end()) {
+        job_gpu += it->second;
+      }
     }
 
     if (job_gpu > 0) {
