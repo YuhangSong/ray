@@ -139,17 +139,21 @@ void UpdateJobGpuUsage(
     delta_sec = 0;
   }
 
-  // 先用旧的 last 时间点到现在的时间差，按“上一段时间的 GPU 占用”做积分
-  RecomputeJobCurrentGpu(registered_placement_groups);
-  auto &current = GetJobCurrentGpuMap();
+  // IMPORTANT: Use the OLD JobCurrentGpuMap (from time `last`) for integration
+  // over the interval [last, now]. This ensures accurate accounting:
+  // - If a job just acquired GPUs, it won't be overcharged
+  // - If a job just released GPUs, it won't be undercharged
+  auto &current = GetJobCurrentGpuMap();  // Contains values from previous update
   auto &usage = GetJobGpuUsageMap();
 
   for (const auto &kv : current) {
     const JobID &job_id = kv.first;
-    const double cur_gpu = kv.second;  // 当前占用的 GPU 数
-    usage[job_id] += cur_gpu * delta_sec;
+    const double prev_gpu = kv.second;  // GPU count during [last, now] interval
+    usage[job_id] += prev_gpu * delta_sec;
   }
 
+  // NOW update to current state for the next interval
+  RecomputeJobCurrentGpu(registered_placement_groups);
   last = now;
 }
 
