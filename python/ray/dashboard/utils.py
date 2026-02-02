@@ -385,6 +385,8 @@ class CustomEncoder(json.JSONEncoder):
 
 def to_camel_case(snake_str):
     """Convert a snake str to camel case."""
+    if not isinstance(snake_str, str):
+        return snake_str
     components = snake_str.split("_")
     # We capitalize the first letter of each component except the first one
     # with the 'title' method and join them together.
