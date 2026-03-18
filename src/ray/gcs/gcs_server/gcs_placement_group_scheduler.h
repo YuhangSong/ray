@@ -366,6 +366,11 @@ class GcsPlacementGroupScheduler : public GcsPlacementGroupSchedulerInterface {
 
   void HandleWaitingRemovedBundles();
 
+  /// Start (or re-arm) a periodic timer that drains waiting_removed_bundles_.
+  /// This ensures that bundles whose resources were still held by actors at
+  /// removal time are eventually released, preventing permanent resource leaks.
+  void ScheduleReturnBundleResources();
+
  protected:
   /// Send bundles PREPARE requests to a node. The PREPARE requests will lock resources
   /// on a node until COMMIT or CANCEL requests are sent to a node.

@@ -38,7 +38,13 @@ GcsPlacementGroupScheduler::GcsPlacementGroupScheduler(
       gcs_table_storage_(gcs_table_storage),
       gcs_node_manager_(gcs_node_manager),
       cluster_resource_scheduler_(cluster_resource_scheduler),
-      raylet_client_pool_(raylet_client_pool) {}
+      raylet_client_pool_(raylet_client_pool) {
+  // Start a periodic timer to drain waiting_removed_bundles_.
+  // Without this, bundles whose resources are still held by actors at PG
+  // removal time will never be released (the only other call site is worker
+  // death), causing a permanent resource leak in the GCS resource view.
+  ScheduleReturnBundleResources();
+}
 
 void GcsPlacementGroupScheduler::ScheduleUnplacedBundles(
     const SchedulePgRequest &request) {
@@ -819,6 +825,23 @@ void GcsPlacementGroupScheduler::HandleWaitingRemovedBundles() {
   for (const auto &listener : resources_changed_listeners_) {
     listener();
   }
+}
+
+void GcsPlacementGroupScheduler::ScheduleReturnBundleResources() {
+  // Check every 1 second for bundles waiting to be released.
+  return_timer_.expires_from_now(boost::posix_time::milliseconds(1000));
+  return_timer_.async_wait([this](const boost::system::error_code &ec) {
+    if (ec) {
+      // Timer was cancelled (e.g. during shutdown).
+      return;
+    }
+    if (!waiting_removed_bundles_.empty()) {
+      HandleWaitingRemovedBundles();
+    }
+    // Re-arm the timer regardless of whether there are waiting bundles,
+    // so it is always ready to drain the queue promptly.
+    ScheduleReturnBundleResources();
+  });
 }
 
 LeaseStatusTracker::LeaseStatusTracker(
