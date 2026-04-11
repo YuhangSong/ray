@@ -57,12 +57,19 @@ ExponentialBackoff CreateDefaultBackoff() {
       max_delay_ns);
 }
 
-// ==================== 新增：按 Job 统计 GPU×时间 ====================
+// ==================== 新增：按 Job 统计显存时间 ====================
 
-// 「累计 GPU×时间」：单位可以理解为 GPU·秒（只是一个相对值，用来排序）
+// 「累计显存时间」：单位可以理解为加权 GPU·秒（只是一个相对值，用来排序）。
+// 当前权重约定：RTX 5090 = 1，Pro 6000 = 3。
+// 对于未携带类型 custom resource 的旧任务，回退到原始 GPU 张数。
 using JobGpuUsageMap = absl::flat_hash_map<JobID, double>;
-// 「当前时刻占用的 GPU 数」：每次按 registered_placement_groups_ 重算
+// 「当前时刻占用的加权 GPU 单位」：每次按 registered_placement_groups_ 重算。
 using JobCurrentGpuMap = absl::flat_hash_map<JobID, double>;
+
+constexpr char kGpu5090ResourceLabel[] = "gpu_5090";
+constexpr char kGpuPro6000ResourceLabel[] = "gpu_pro6000";
+constexpr double kGpuMemoryWeight5090 = 1.0;
+constexpr double kGpuMemoryWeightPro6000 = 3.0;
 
 // 这几个用静态单例，避免改 .h
 JobGpuUsageMap &GetJobGpuUsageMap() {
@@ -75,15 +82,15 @@ JobCurrentGpuMap &GetJobCurrentGpuMap() {
   return *m;
 }
 
-// 上一次做 GPU×时间 积分的时间戳（ns）
+// 上一次做显存时间积分的时间戳（ns）
 int64_t &GetLastGpuUsageUpdateTimeNs() {
   static int64_t t = 0;
   return t;
 }
 
-// Dirty flag for JobCurrentGpuMap - indicates GPU allocations may have changed.
+// Dirty flag for JobCurrentGpuMap - indicates weighted GPU allocations may have changed.
 // This optimization avoids full scans of registered_placement_groups_ when
-// GPU allocations haven't changed.
+// allocations haven't changed.
 bool &GetJobCurrentGpuMapDirty() {
   static bool dirty = true;  // Start dirty to trigger initial computation
   return dirty;
@@ -95,17 +102,47 @@ void MarkJobCurrentGpuMapDirty() {
   GetJobCurrentGpuMapDirty() = true;
 }
 
+double GetBundleMemoryTimeUnits(const rpc::Bundle &bundle) {
+  double weighted_gpu = 0.0;
+
+  auto add_weighted_resource = [&](const char *resource_label, double weight) {
+    auto it = bundle.unit_resources().find(resource_label);
+    if (it != bundle.unit_resources().end()) {
+      weighted_gpu += it->second * weight;
+    }
+  };
+
+  add_weighted_resource(kGpu5090ResourceLabel, kGpuMemoryWeight5090);
+  add_weighted_resource(kGpuPro6000ResourceLabel, kGpuMemoryWeightPro6000);
+
+  if (weighted_gpu > 0) {
+    return weighted_gpu;
+  }
+
+  auto gpu_it = bundle.unit_resources().find(kGPU_ResourceLabel);
+  if (gpu_it != bundle.unit_resources().end()) {
+    return gpu_it->second;
+  }
+  return 0.0;
+}
+
+void ResetGpuUsageTrackingState() {
+  GetJobGpuUsageMap().clear();
+  GetJobCurrentGpuMap().clear();
+  GetLastGpuUsageUpdateTimeNs() = 0;
+  GetJobCurrentGpuMapDirty() = true;
+}
+
 // 根据当前所有已注册 PG（只看已经放到某个 node 上的 bundle）
-// 重新统计「当前每个 Job 正在占用的 GPU 数」
+// 重新统计「当前每个 Job 正在占用的加权 GPU 单位」
 // Note: Use raw protobuf data to avoid filling the bundle cache (side effect).
 // Returns true if recomputation was performed, false if skipped (not dirty).
 bool RecomputeJobCurrentGpu(
     const absl::flat_hash_map<PlacementGroupID, std::shared_ptr<GcsPlacementGroup>>
         &registered_placement_groups) {
-  // Check dirty flag - skip full scan if nothing has changed
   bool &dirty = GetJobCurrentGpuMapDirty();
   if (!dirty) {
-    return false;  // No changes, skip recomputation
+    return false;
   }
 
   auto &current = GetJobCurrentGpuMap();
@@ -119,20 +156,13 @@ bool RecomputeJobCurrentGpu(
     }
 
     double job_gpu = 0.0;
-    // Use raw protobuf data to avoid filling the bundle cache
     const auto &bundles = pg->GetPlacementGroupTableData().bundles();
     for (const auto &bundle : bundles) {
-      // 还没分配到具体 node 的 bundle 不算资源占用
-      if (bundle.node_id().empty() ||
-          NodeID::FromBinary(bundle.node_id()).IsNil()) {
+      if (bundle.node_id().empty() || NodeID::FromBinary(bundle.node_id()).IsNil()) {
         continue;
       }
 
-      // Get GPU count directly from unit_resources map
-      auto it = bundle.unit_resources().find(kGPU_ResourceLabel);
-      if (it != bundle.unit_resources().end()) {
-        job_gpu += it->second;
-      }
+      job_gpu += GetBundleMemoryTimeUnits(bundle);
     }
 
     if (job_gpu > 0) {
@@ -140,27 +170,24 @@ bool RecomputeJobCurrentGpu(
     }
   }
 
-  dirty = false;  // Clear dirty flag after recomputation
+  dirty = false;
   return true;
 }
 
 // Score decay half-life in seconds. After this time, historical usage decays to half.
 // This prevents long-running jobs from being permanently penalized by old history.
-// A 1-hour half-life balances fairness between new and existing jobs.
 constexpr double kGpuUsageDecayHalfLifeSec = 3600.0;  // 1 hour
 
 // Precompute ln(2) for decay calculation
 constexpr double kLn2 = 0.693147180559945;
 
-// 基于「当前占用 GPU 数」做一次积分，更新到累计 GPU×时间
-// Also applies exponential decay to historical usage scores.
+// 基于「当前占用的加权 GPU 单位」做一次积分，更新到累计显存时间。
 void UpdateJobGpuUsage(
     const absl::flat_hash_map<PlacementGroupID, std::shared_ptr<GcsPlacementGroup>>
         &registered_placement_groups) {
   const int64_t now = absl::GetCurrentTimeNanos();
   auto &last = GetLastGpuUsageUpdateTimeNs();
 
-  // 第一次调用：只初始化当前占用，不积分
   if (last == 0) {
     last = now;
     RecomputeJobCurrentGpu(registered_placement_groups);
@@ -169,43 +196,33 @@ void UpdateJobGpuUsage(
 
   double delta_sec = static_cast<double>(now - last) / 1e9;
   if (delta_sec < 0) {
-    // 理论上不会出现，防御性写法
     delta_sec = 0;
   }
 
-  // Calculate decay factor: score decays exponentially over time
-  // decay_factor = exp(-ln(2) * delta_sec / half_life)
-  // After half_life seconds, old scores are worth half as much
   double decay_factor = 1.0;
   if (delta_sec > 0 && kGpuUsageDecayHalfLifeSec > 0) {
     decay_factor = std::exp(-kLn2 * delta_sec / kGpuUsageDecayHalfLifeSec);
   }
 
-  // IMPORTANT: Use the OLD JobCurrentGpuMap (from time `last`) for integration
-  // over the interval [last, now]. This ensures accurate accounting:
-  // - If a job just acquired GPUs, it won't be overcharged
-  // - If a job just released GPUs, it won't be undercharged
-  auto &current = GetJobCurrentGpuMap();  // Contains values from previous update
+  auto &current = GetJobCurrentGpuMap();
   auto &usage = GetJobGpuUsageMap();
 
-  // Apply decay to all existing scores, then add new usage
   for (auto &kv : usage) {
     kv.second *= decay_factor;
   }
 
   for (const auto &kv : current) {
     const JobID &job_id = kv.first;
-    const double prev_gpu = kv.second;  // GPU count during [last, now] interval
+    const double prev_gpu = kv.second;
     usage[job_id] += prev_gpu * delta_sec;
   }
 
-  // NOW update to current state for the next interval
   RecomputeJobCurrentGpu(registered_placement_groups);
   last = now;
 }
 
-// 获取某个 Job 的「累计 GPU×时间」score，找不到就视为 0
-double GetJobGpuTimeUsageScore(const JobID &job_id) {
+// 获取某个 Job 的「累计显存时间」score，找不到就视为 0。
+double GetJobMemoryTimeUsageScore(const JobID &job_id) {
   if (job_id.IsNil()) {
     return 0.0;
   }
@@ -239,7 +256,6 @@ bool JobHasPlacementGroups(
   }
   return false;
 }
-
 }  // namespace
 
 void GcsPlacementGroup::UpdateState(
@@ -398,6 +414,24 @@ GcsPlacementGroupManager::GcsPlacementGroupManager(
              {"Source", "gcs"}});
       });
   Tick();
+}
+
+void GcsPlacementGroupManager::ResetGpuUsageForTesting() {
+  ResetGpuUsageTrackingState();
+}
+
+void GcsPlacementGroupManager::UpdateGpuUsageForTesting() {
+  UpdateJobGpuUsage(registered_placement_groups_);
+}
+
+double GcsPlacementGroupManager::GetJobMemoryTimeUsageScoreForTesting(
+    const JobID &job_id) const {
+  return GetJobMemoryTimeUsageScore(job_id);
+}
+
+double GcsPlacementGroupManager::GetBundleMemoryTimeUnitsForTesting(
+    const rpc::Bundle &bundle) const {
+  return GetBundleMemoryTimeUnits(bundle);
 }
 
 void GcsPlacementGroupManager::RegisterPlacementGroup(
@@ -618,14 +652,14 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
     return;
   }
 
-  // 更新基于 Job 的「GPU×时间」积分
+  // 更新基于 Job 的「显存时间」积分
   UpdateJobGpuUsage(registered_placement_groups_);
 
   const int64_t now = absl::GetCurrentTimeNanos();
 
   // 在所有 rank <= now 的 pending PG 中：
   //   - 先看它属于哪个 Job；
-  //   - 优先选择「累计 GPU×时间 usage 最小的 Job」；
+  //   - 优先选择「累计显存时间 usage 最小的 Job」；
   //   - 同一个 Job 内仍按照 rank（时间戳）实现近似 FIFO。
   auto best_it = pending_placement_groups_.end();
   double best_score = 0.0;
@@ -644,7 +678,7 @@ void GcsPlacementGroupManager::SchedulePendingPlacementGroups() {
 
     const auto &pg = it->second.second;
     const JobID &job_id = pg->GetCreatorJobId();
-    double score = GetJobGpuTimeUsageScore(job_id);
+    double score = GetJobMemoryTimeUsageScore(job_id);
 
     if (!found || score < best_score ||
         (score == best_score && rank < best_rank)) {

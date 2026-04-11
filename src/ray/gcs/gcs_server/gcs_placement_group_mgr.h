@@ -403,6 +403,15 @@ class GcsPlacementGroupManager : public rpc::PlacementGroupInfoHandler {
                                     GcsResourceManager &gcs_resource_manager);
 
  private:
+  FRIEND_TEST(GcsFairSchedulingTest, BundleMemoryTimeWeighting);
+  FRIEND_TEST(GcsFairSchedulingTest,
+              WeightedMemoryTimeFairSchedulingPrefersLowerUsageJob);
+
+  void ResetGpuUsageForTesting();
+  void UpdateGpuUsageForTesting();
+  double GetJobMemoryTimeUsageScoreForTesting(const JobID &job_id) const;
+  double GetBundleMemoryTimeUnitsForTesting(const rpc::Bundle &bundle) const;
+
   /// Push a placement group to pending queue.
   ///
   /// \param pg The placementgroup we are adding

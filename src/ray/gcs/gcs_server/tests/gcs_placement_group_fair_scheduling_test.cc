@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Tests for fair GPU×Time scheduling in GcsPlacementGroupManager.
-// This scheduling policy prioritizes jobs with lower cumulative GPU×Time usage.
+// Tests for fair weighted GPU-memory×Time scheduling in GcsPlacementGroupManager.
 
 #include <memory>
 #include <utility>
+#include <vector>
+
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 // clang-format off
 #include "gtest/gtest.h"
 #include "gmock/gmock.h"
@@ -38,17 +41,20 @@ using namespace ray::gcs;   // NOLINT
 namespace ray {
 namespace gcs {
 
-// Helper to create a placement group request with GPU resources
 static rpc::CreatePlacementGroupRequest GenGpuPlacementGroupRequest(
     const std::string &name,
     int bundles_count,
     double gpu_num,
-    const JobID &job_id) {
+    const JobID &job_id,
+    const std::string &selector_resource = "") {
   rpc::CreatePlacementGroupRequest request;
   std::vector<std::unordered_map<std::string, double>> bundles;
   std::unordered_map<std::string, double> bundle;
   bundle["GPU"] = gpu_num;
-  bundle["CPU"] = 1.0;  // Also add CPU for realistic setup
+  bundle["CPU"] = 1.0;
+  if (!selector_resource.empty()) {
+    bundle[selector_resource] = gpu_num;
+  }
   for (int i = 0; i < bundles_count; ++i) {
     bundles.push_back(bundle);
   }
@@ -56,6 +62,16 @@ static rpc::CreatePlacementGroupRequest GenGpuPlacementGroupRequest(
       name, bundles, rpc::PlacementStrategy::SPREAD, job_id, ActorID::Nil());
   request.mutable_placement_group_spec()->CopyFrom(pg_spec.GetMessage());
   return request;
+}
+
+static SchedulePgRequest *FindScheduledRequestForJob(
+    std::vector<SchedulePgRequest> &requests, const JobID &job_id) {
+  for (auto &request : requests) {
+    if (request.placement_group->GetCreatorJobId() == job_id) {
+      return &request;
+    }
+  }
+  return nullptr;
 }
 
 class GcsFairSchedulingTest : public Test {
@@ -92,11 +108,10 @@ class GcsFairSchedulingTest : public Test {
   std::shared_ptr<CounterMap<rpc::PlacementGroupTableData::PlacementGroupState>> counter_;
 };
 
-// Test: Placement groups with GPU resources are registered correctly
 TEST_F(GcsFairSchedulingTest, GpuPlacementGroupRegistration) {
   JobID job1 = JobID::FromInt(1);
 
-  auto req = GenGpuPlacementGroupRequest("pg1", 2, 4.0, job1);  // 4 GPUs per bundle
+  auto req = GenGpuPlacementGroupRequest("pg1", 2, 4.0, job1);
   auto pg = std::make_shared<GcsPlacementGroup>(req, "", counter_);
 
   SchedulePgRequest request;
@@ -111,15 +126,11 @@ TEST_F(GcsFairSchedulingTest, GpuPlacementGroupRegistration) {
   std::move(*put_cb).Post("GpuPlacementGroupRegistration", true);
   io_context_.poll();
 
-  // Verify the PG was scheduled
   ASSERT_EQ(request.placement_group, pg);
   ASSERT_EQ(request.placement_group->GetCreatorJobId(), job1);
-
-  // Verify the PG state is PENDING
   ASSERT_EQ(pg->GetState(), rpc::PlacementGroupTableData::PENDING);
 }
 
-// Test: Multiple placement groups from different jobs can be registered
 TEST_F(GcsFairSchedulingTest, MultipleJobsRegisterPgs) {
   JobID job1 = JobID::FromInt(1);
   JobID job2 = JobID::FromInt(2);
@@ -144,36 +155,27 @@ TEST_F(GcsFairSchedulingTest, MultipleJobsRegisterPgs) {
 
   auto cb = [](Status s) {};
 
-  // Register first PG
   gcs_placement_group_manager_->RegisterPlacementGroup(pg1, cb);
   std::move(*put_cb).Post("MultipleJobsRegisterPgs_1", true);
   io_context_.poll();
 
-  // First PG should be scheduled
   ASSERT_GE(scheduled_pgs.size(), 1);
   ASSERT_EQ(scheduled_pgs[0]->GetCreatorJobId(), job1);
 
-  // Register second PG (while first is still being scheduled)
   gcs_placement_group_manager_->RegisterPlacementGroup(pg2, cb);
   std::move(*put_cb).Post("MultipleJobsRegisterPgs_2", true);
   io_context_.poll();
 
-  // At least the first PG should have been scheduled
-  // The second PG may be in the pending queue waiting
   ASSERT_GE(scheduled_pgs.size(), 1);
-
-  // Both PGs should have different job IDs
   ASSERT_NE(pg1->GetCreatorJobId(), pg2->GetCreatorJobId());
 }
 
-// Test: Verify that bundles contain expected GPU resources
 TEST_F(GcsFairSchedulingTest, BundlesContainGpuResources) {
   JobID job1 = JobID::FromInt(1);
 
-  auto req = GenGpuPlacementGroupRequest("pg1", 2, 8.0, job1);  // 8 GPUs per bundle
+  auto req = GenGpuPlacementGroupRequest("pg1", 2, 8.0, job1);
   auto pg = std::make_shared<GcsPlacementGroup>(req, "", counter_);
 
-  // Verify the bundle resources
   const auto &bundles = pg->GetPlacementGroupTableData().bundles();
   ASSERT_EQ(bundles.size(), 2);
 
@@ -184,7 +186,6 @@ TEST_F(GcsFairSchedulingTest, BundlesContainGpuResources) {
   }
 }
 
-// Test: Scheduling failure keeps PG in PENDING state
 TEST_F(GcsFairSchedulingTest, SchedulingFailureKeepsPending) {
   JobID job1 = JobID::FromInt(1);
 
@@ -204,24 +205,17 @@ TEST_F(GcsFairSchedulingTest, SchedulingFailureKeepsPending) {
   std::move(*put_cb).Post("SchedulingFailureKeepsPending", true);
   io_context_.poll();
 
-  // Verify initial scheduling attempt
   ASSERT_EQ(request.placement_group, pg);
 
-  // Simulate scheduling failure (but still schedulable - no retry limit reached)
   request.failure_callback(pg, true);
 
-  // After failure, the PG state should still be PENDING (not REMOVED or other)
   ASSERT_EQ(pg->GetState(), rpc::PlacementGroupTableData::PENDING);
-
-  // The scheduling attempt counter should have increased
   ASSERT_GE(pg->GetStats().scheduling_attempt(), 1);
 }
 
-// Test: CPU-only placement groups are handled correctly
 TEST_F(GcsFairSchedulingTest, CpuOnlyPlacementGroupRegistration) {
   JobID job1 = JobID::FromInt(1);
 
-  // Create a CPU-only placement group
   auto req =
       Mocker::GenCreatePlacementGroupRequest("", rpc::PlacementStrategy::SPREAD, 2, 4.0, job1);
   auto pg = std::make_shared<GcsPlacementGroup>(req, "", counter_);
@@ -238,15 +232,139 @@ TEST_F(GcsFairSchedulingTest, CpuOnlyPlacementGroupRegistration) {
   std::move(*put_cb).Post("CpuOnlyPlacementGroupRegistration", true);
   io_context_.poll();
 
-  // Verify the PG was scheduled
   ASSERT_EQ(request.placement_group, pg);
 
-  // Verify the bundles don't have GPU resources
   const auto &bundles = pg->GetPlacementGroupTableData().bundles();
   for (const auto &bundle : bundles) {
     auto it = bundle.unit_resources().find("GPU");
-    ASSERT_EQ(it, bundle.unit_resources().end());  // No GPU resource
+    ASSERT_EQ(it, bundle.unit_resources().end());
   }
+}
+
+TEST_F(GcsFairSchedulingTest, BundleMemoryTimeWeighting) {
+  gcs_placement_group_manager_->ResetGpuUsageForTesting();
+
+  JobID job1 = JobID::FromInt(101);
+  auto pg_5090 = std::make_shared<GcsPlacementGroup>(
+      GenGpuPlacementGroupRequest("pg-5090", 1, 1.0, job1, "gpu_5090"), "", counter_);
+  auto pg_pro6000 = std::make_shared<GcsPlacementGroup>(
+      GenGpuPlacementGroupRequest("pg-pro6000", 1, 1.0, job1, "gpu_pro6000"),
+      "",
+      counter_);
+  auto pg_generic = std::make_shared<GcsPlacementGroup>(
+      GenGpuPlacementGroupRequest("pg-generic", 1, 2.0, job1), "", counter_);
+
+  ASSERT_DOUBLE_EQ(
+      gcs_placement_group_manager_->GetBundleMemoryTimeUnitsForTesting(
+          pg_5090->GetPlacementGroupTableData().bundles(0)),
+      1.0);
+  ASSERT_DOUBLE_EQ(
+      gcs_placement_group_manager_->GetBundleMemoryTimeUnitsForTesting(
+          pg_pro6000->GetPlacementGroupTableData().bundles(0)),
+      3.0);
+  ASSERT_DOUBLE_EQ(
+      gcs_placement_group_manager_->GetBundleMemoryTimeUnitsForTesting(
+          pg_generic->GetPlacementGroupTableData().bundles(0)),
+      2.0);
+}
+
+TEST_F(GcsFairSchedulingTest,
+       WeightedMemoryTimeFairSchedulingPrefersLowerUsageJob) {
+  gcs_placement_group_manager_->ResetGpuUsageForTesting();
+
+  JobID heavy_job = JobID::FromInt(201);
+  JobID light_job = JobID::FromInt(202);
+
+  auto running_heavy_pg = std::make_shared<GcsPlacementGroup>(
+      GenGpuPlacementGroupRequest(
+          "running-heavy", 1, 1.0, heavy_job, "gpu_pro6000"),
+      "",
+      counter_);
+  auto running_light_pg = std::make_shared<GcsPlacementGroup>(
+      GenGpuPlacementGroupRequest(
+          "running-light", 1, 1.0, light_job, "gpu_5090"),
+      "",
+      counter_);
+
+  std::unique_ptr<Postable<void(bool)>> put_cb;
+  EXPECT_CALL(*store_client_, AsyncPut(_, _, _, _, _))
+      .Times(AtLeast(2))
+      .WillRepeatedly(DoAll(SaveArgToUniquePtr<4>(&put_cb), Return(Status::OK())));
+
+  std::vector<SchedulePgRequest> scheduled_requests;
+  EXPECT_CALL(*gcs_placement_group_scheduler_, ScheduleUnplacedBundles(_))
+      .Times(2)
+      .WillRepeatedly(Invoke([&scheduled_requests](const SchedulePgRequest &request) {
+        scheduled_requests.push_back(request);
+      }));
+
+  auto cb = [](Status s) {};
+  gcs_placement_group_manager_->RegisterPlacementGroup(running_heavy_pg, cb);
+  ASSERT_NE(put_cb, nullptr);
+  std::move(*put_cb).Post("WeightedMemoryTime_running_heavy", true);
+  io_context_.poll();
+
+  ASSERT_EQ(scheduled_requests.size(), 1);
+  auto heavy_request = FindScheduledRequestForJob(scheduled_requests, heavy_job);
+  ASSERT_NE(heavy_request, nullptr);
+  running_heavy_pg->GetMutableBundle(0)->set_node_id(NodeID::FromRandom().Binary());
+  running_heavy_pg->UpdateState(rpc::PlacementGroupTableData::PREPARED);
+  heavy_request->success_callback(running_heavy_pg);
+  io_context_.poll();
+
+  gcs_placement_group_manager_->RegisterPlacementGroup(running_light_pg, cb);
+  ASSERT_NE(put_cb, nullptr);
+  std::move(*put_cb).Post("WeightedMemoryTime_running_light", true);
+  io_context_.poll();
+
+  ASSERT_EQ(scheduled_requests.size(), 2);
+  auto light_request = FindScheduledRequestForJob(scheduled_requests, light_job);
+  ASSERT_NE(light_request, nullptr);
+  running_light_pg->GetMutableBundle(0)->set_node_id(NodeID::FromRandom().Binary());
+  running_light_pg->UpdateState(rpc::PlacementGroupTableData::PREPARED);
+  light_request->success_callback(running_light_pg);
+  io_context_.poll();
+
+  Mock::VerifyAndClearExpectations(gcs_placement_group_scheduler_.get());
+  Mock::VerifyAndClearExpectations(store_client_.get());
+
+  gcs_placement_group_manager_->UpdateGpuUsageForTesting();
+  absl::SleepFor(absl::Milliseconds(20));
+  gcs_placement_group_manager_->UpdateGpuUsageForTesting();
+
+  const double heavy_score =
+      gcs_placement_group_manager_->GetJobMemoryTimeUsageScoreForTesting(heavy_job);
+  const double light_score =
+      gcs_placement_group_manager_->GetJobMemoryTimeUsageScoreForTesting(light_job);
+  ASSERT_GT(heavy_score, light_score * 2.5);
+
+  std::unique_ptr<Postable<void(bool)>> pending_put_cb;
+  EXPECT_CALL(*store_client_, AsyncPut(_, _, _, _, _))
+      .Times(AtLeast(2))
+      .WillRepeatedly(
+          DoAll(SaveArgToUniquePtr<4>(&pending_put_cb), Return(Status::OK())));
+
+  SchedulePgRequest chosen_request;
+  EXPECT_CALL(*gcs_placement_group_scheduler_, ScheduleUnplacedBundles(_))
+      .WillOnce(DoAll(SaveArg<0>(&chosen_request)));
+
+  auto pending_heavy_pg = std::make_shared<GcsPlacementGroup>(
+      GenGpuPlacementGroupRequest(
+          "pending-heavy", 1, 1.0, heavy_job, "gpu_pro6000"),
+      "",
+      counter_);
+  auto pending_light_pg = std::make_shared<GcsPlacementGroup>(
+      GenGpuPlacementGroupRequest(
+          "pending-light", 1, 1.0, light_job, "gpu_5090"),
+      "",
+      counter_);
+
+  gcs_placement_group_manager_->RegisterPlacementGroup(pending_heavy_pg, cb);
+  gcs_placement_group_manager_->RegisterPlacementGroup(pending_light_pg, cb);
+
+  gcs_placement_group_manager_->SchedulePendingPlacementGroups();
+
+  ASSERT_EQ(chosen_request.placement_group->GetCreatorJobId(), light_job);
 }
 
 }  // namespace gcs
