@@ -66,10 +66,15 @@ using JobGpuUsageMap = absl::flat_hash_map<JobID, double>;
 // 「当前时刻占用的加权 GPU 单位」：每次按 registered_placement_groups_ 重算。
 using JobCurrentGpuMap = absl::flat_hash_map<JobID, double>;
 
-constexpr char kGpu5090ResourceLabel[] = "gpu_5090";
-constexpr char kGpuPro6000ResourceLabel[] = "gpu_pro6000";
-constexpr double kGpuMemoryWeight5090 = 1.0;
-constexpr double kGpuMemoryWeightPro6000 = 3.0;
+using GpuMemoryWeightEntry = std::pair<const char *, double>;
+
+const std::vector<GpuMemoryWeightEntry> &GetGpuMemoryWeightsByResourceLabel() {
+  static const auto *weights = new std::vector<GpuMemoryWeightEntry>{
+      {"gpu_5090", 1.0},
+      {"gpu_pro6000", 3.0},
+  };
+  return *weights;
+}
 
 // 这几个用静态单例，避免改 .h
 JobGpuUsageMap &GetJobGpuUsageMap() {
@@ -112,8 +117,9 @@ double GetBundleMemoryTimeUnits(const rpc::Bundle &bundle) {
     }
   };
 
-  add_weighted_resource(kGpu5090ResourceLabel, kGpuMemoryWeight5090);
-  add_weighted_resource(kGpuPro6000ResourceLabel, kGpuMemoryWeightPro6000);
+  for (const auto &entry : GetGpuMemoryWeightsByResourceLabel()) {
+    add_weighted_resource(entry.first, entry.second);
+  }
 
   if (weighted_gpu > 0) {
     return weighted_gpu;
