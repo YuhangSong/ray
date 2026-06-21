@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
 from typing import List, Optional
 
@@ -9,10 +10,64 @@ from ray._private.runtime_env.plugin import RuntimeEnvPlugin
 
 default_logger = logging.getLogger(__name__)
 
+# ------------------------------------------------------------------
+# Container runtime detection
+# ------------------------------------------------------------------
+
+_CONTAINER_RUNTIME: str | None = None
+
+
+def _detect_container_runtime() -> str:
+    """Return the available container runtime: ``"docker"`` or ``"podman"``.
+
+    Docker is preferred when both are present.  The result is cached
+    after the first call.
+    """
+    global _CONTAINER_RUNTIME
+    if _CONTAINER_RUNTIME is not None:
+        return _CONTAINER_RUNTIME
+
+    for candidate in ("docker", "podman"):
+        if shutil.which(candidate):
+            _CONTAINER_RUNTIME = candidate
+            return _CONTAINER_RUNTIME
+
+    raise RuntimeError(
+        "Neither Docker nor Podman found on PATH. "
+        "Install one of them to use runtime_env image_uri / container."
+    )
+
+
+def _is_docker() -> bool:
+    return _detect_container_runtime() == "docker"
+
+
+def _volume_flag(path: str) -> str:
+    """Return a ``-v`` volume-mount argument suitable for the runtime.
+
+    Podman on SELinux hosts needs ``:Z``; Docker does not.
+    """
+    if _is_docker():
+        return f"{path}:{path}"
+    return f"{path}:{path}:Z"
+
+
+def _gpu_flags() -> list[str]:
+    """Extra flags needed for GPU passthrough."""
+    if _is_docker():
+        return ["--gpus", "all"]
+    return []
+
+
+# ------------------------------------------------------------------
+# Implementation
+# ------------------------------------------------------------------
+
 
 async def _create_impl(image_uri: str, logger: logging.Logger):
     # Pull image if it doesn't exist
     # Also get path to `default_worker.py` inside the image.
+    runtime = _detect_container_runtime()
     with tempfile.TemporaryDirectory() as tmpdir:
         os.chmod(tmpdir, 0o777)
         result_file = os.path.join(tmpdir, "worker_path.txt")
@@ -21,19 +76,20 @@ import ray._private.workers.default_worker as dw
 with open('/shared/worker_path.txt', 'w') as f:
     f.write(dw.__file__)
 """
+        vol = _volume_flag(tmpdir)
         cmd = [
-            "podman",
+            runtime,
             "run",
             "--rm",
             "-v",
-            f"{tmpdir}:/shared:Z",
+            vol,
             image_uri,
             "python",
             "-c",
             get_worker_path_script,
         ]
 
-        logger.info("Pulling image %s", image_uri)
+        logger.info("Pulling image %s with %s", image_uri, runtime)
 
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -43,12 +99,15 @@ with open('/shared/worker_path.txt', 'w') as f:
 
         if process.returncode != 0:
             raise RuntimeError(
-                f"Podman command failed: cmd={cmd}, returncode={process.returncode}, stdout={stdout.decode()}, stderr={stderr.decode()}"
+                f"Container command failed ({runtime}): cmd={cmd}, "
+                f"returncode={process.returncode}, "
+                f"stdout={stdout.decode()}, stderr={stderr.decode()}"
             )
 
         if not os.path.exists(result_file):
             raise FileNotFoundError(
-                f"Worker path file not created when getting worker path for image {image_uri}"
+                f"Worker path file not created when getting worker path "
+                f"for image {image_uri}"
             )
 
         with open(result_file, "r") as f:
@@ -59,7 +118,7 @@ with open('/shared/worker_path.txt', 'w') as f:
                 f"Invalid worker path inferred in image {image_uri}: {worker_path}"
             )
 
-        logger.info(f"Inferred worker path in image {image_uri}: {worker_path}")
+        logger.info("Inferred worker path in image %s: %s", image_uri, worker_path)
         return worker_path
 
 
@@ -73,27 +132,41 @@ def _modify_context_impl(
 ):
     context.override_worker_entrypoint = worker_path
 
-    container_driver = "podman"
+    runtime = _detect_container_runtime()
+    is_docker = runtime == "docker"
+
     container_command = [
-        container_driver,
+        runtime,
         "run",
         "-v",
-        ray_tmp_dir + ":" + ray_tmp_dir,
-        "--cgroup-manager=cgroupfs",
+        _volume_flag(ray_tmp_dir),
+    ]
+
+    # Podman-specific flags for rootless operation
+    if not is_docker:
+        container_command.extend([
+            "--cgroup-manager=cgroupfs",
+            # NOTE(zcin): Mounted volumes in rootless containers are
+            # owned by the user `root`. The user on host (which will
+            # usually be `ray` if this is being run in a ray docker
+            # image) who started the container is mapped using user
+            # namespaces to the user `root` in a rootless container. In
+            # order for the Ray Python worker to access the mounted ray
+            # tmp dir, we need to use keep-id mode which maps the user
+            # as itself (instead of as `root`) into the container.
+            # https://www.redhat.com/sysadmin/rootless-podman-user-namespace-modes
+            "--userns=keep-id",
+        ])
+
+    # Network / process namespace (shared with host for Ray IPC)
+    container_command.extend([
         "--network=host",
         "--pid=host",
         "--ipc=host",
-        # NOTE(zcin): Mounted volumes in rootless containers are
-        # owned by the user `root`. The user on host (which will
-        # usually be `ray` if this is being run in a ray docker
-        # image) who started the container is mapped using user
-        # namespaces to the user `root` in a rootless container. In
-        # order for the Ray Python worker to access the mounted ray
-        # tmp dir, we need to use keep-id mode which maps the user
-        # as itself (instead of as `root`) into the container.
-        # https://www.redhat.com/sysadmin/rootless-podman-user-namespace-modes
-        "--userns=keep-id",
-    ]
+    ])
+
+    # GPU passthrough
+    container_command.extend(_gpu_flags())
 
     # Environment variables to set in container
     env_vars = dict()
@@ -126,13 +199,16 @@ def _modify_context_impl(
     container_command.append("python")
     container_command.append(image_uri)
 
-    # Example:
-    # podman run -v /tmp/ray:/tmp/ray
-    # --cgroup-manager=cgroupfs --network=host --pid=host --ipc=host
-    # --userns=keep-id --env RAY_RAYLET_PID=23478 --env RAY_JOB_ID=$RAY_JOB_ID
-    # --entrypoint python rayproject/ray:nightly-py39
+    # Example (docker):
+    # docker run -v /tmp/ray:/tmp/ray
+    # --network=host --pid=host --ipc=host --gpus all
+    # --env RAY_RAYLET_PID=23478 --env RAY_JOB_ID=$RAY_JOB_ID
+    # --entrypoint python my-custom-image:latest
     container_command_str = " ".join(container_command)
-    logger.info(f"Starting worker in container with prefix {container_command_str}")
+    logger.info(
+        "Starting worker in container (%s) with prefix %s",
+        runtime, container_command_str,
+    )
 
     context.py_executable = container_command_str
 
